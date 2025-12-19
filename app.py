@@ -592,7 +592,7 @@ def save_traffic(data):
 def traffic_ping():
     payload = request.get_json(force=True) or {}
     print("MOBILE PING >>>", payload) 
-    payload["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload["ts"] = datetime.now(timezone.utc).isoformat()
     traffic = load_traffic()
     traffic.append(payload)
     save_traffic(traffic)
@@ -4114,5 +4114,6 @@ def check_user_not_locked(user_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
