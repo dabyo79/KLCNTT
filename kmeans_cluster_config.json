@@ -1,0 +1,42 @@
+{
+  "n_clusters": 4,
+  "trained_at": "2025-12-08T12:09:30.556121",
+  "clusters": {
+    "0": {
+      "size": 26,
+      "avg_price": 32155537.115384616,
+      "avg_ram": 12.307692307692308,
+      "avg_storage": 620.3076923076923,
+      "rate_dgpu": 1.0,
+      "top_purpose": "doanh nhân",
+      "tag": "doanh nhân"
+    },
+    "1": {
+      "size": 42,
+      "avg_price": 30748784.38095238,
+      "avg_ram": 11.428571428571429,
+      "avg_storage": 347.42857142857144,
+      "rate_dgpu": 0.0,
+      "top_purpose": "lập trình",
+      "tag": "lập trình"
+    },
+    "2": {
+      "size": 29,
+      "avg_price": 35319546.89655172,
+      "avg_ram": 32.0,
+      "avg_storage": 503.17241379310343,
+      "rate_dgpu": 0.5517241379310345,
+      "top_purpose": "đồ họa",
+      "tag": "đồ họa"
+    },
+    "3": {
+      "size": 26,
+      "avg_price": 26805712.576923076,
+      "avg_ram": 19.384615384615383,
+      "avg_storage": 1024.0,
+      "rate_dgpu": 0.0,
+      "top_purpose": "doanh nhân",
+      "tag": "doanh nhân"
+    }
+  }
+}
