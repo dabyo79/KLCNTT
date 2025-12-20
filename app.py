@@ -116,6 +116,8 @@ def send_email(to_email: str, subject: str, body: str):
 @app.route("/api/request_reset_otp", methods=["POST"])
 def request_reset_otp():
     data = request.get_json(force=True) or {}
+    
+
     email = data.get("email")
     if not email:
         return jsonify({"error": "missing email"}), 400
@@ -142,12 +144,7 @@ def request_reset_otp():
 
 @app.route("/api/reset_password_with_otp", methods=["POST"])
 def reset_password_with_otp():
-    if not check_user_not_locked(user_id):
-        return jsonify({
-            "ok": False,
-            "reason": "user_locked",
-            "message": "Tài khoản của bạn đã bị khóa"
-        }), 403
+    
     data = request.get_json(force=True) or {}
     email = data.get("email")
     otp = data.get("otp")
@@ -168,7 +165,10 @@ def reset_password_with_otp():
     )
 
     rows = res.data or []
+
+
     if not rows:
+        print("DEBUG_FAIL_REASON: otp_not_found")
         return jsonify({"ok": False, "reason": "otp_not_found"}), 400
 
     row = rows[0]
@@ -185,6 +185,8 @@ def reset_password_with_otp():
             return jsonify({"ok": False, "reason": "invalid_expires"}), 500
 
         now_utc = datetime.now(timezone.utc)
+        
+
         if now_utc > expires_at:
             return jsonify({"ok": False, "reason": "expired"}), 400
 
@@ -205,6 +207,7 @@ def reset_password_with_otp():
 
 # lọc lại một lần nữa theo email (phòng trường hợp api hơi quái)
     users = [u for u in users if (u.get("email") or "").lower() == email.lower()]
+    print("DEBUG_FILTERED_USERS:", users)
 
     if not users:
         return jsonify({"ok": False, "reason": "user_not_found"}), 400
@@ -214,6 +217,13 @@ def reset_password_with_otp():
         return jsonify({"ok": False, "reason": "multiple_users_same_email"}), 500
 
     user_id = users[0]["id"]
+    # 3.1 Check user có bị khóa không
+    if not check_user_not_locked(user_id):
+        return jsonify({
+            "ok": False,
+            "reason": "user_locked",
+            "message": "Tài khoản của bạn đã bị khóa"
+        }), 403
 
 
     # 4. Update password qua Supabase Admin
@@ -292,100 +302,169 @@ except Exception as e:
     CF_USER_ITEM_MATRIX = None
     print("Không load được CF ALS model:", e)
 
+def debug_print_some_cf_users(n=10):
+    if CF_MODEL is None or CF_USER2IDX is None:
+        print("[CF] missing model or mapping")
+        return
+
+    n_users_model = CF_MODEL.user_factors.shape[0]
+    ok = [(uid, idx) for uid, idx in CF_USER2IDX.items() if idx < n_users_model]
+    ok = sorted(ok, key=lambda x: x[1])
+    print(f"[CF] n_users_model={n_users_model}, ok_users={len(ok)}")
+    print("[CF] sample ok user_ids:", ok[:n])
+
+debug_print_some_cf_users(5)
+
 # ========== HYBRID: CONTENT + CF (ALS) ==========
 
-def get_cf_scores_for_user_items(user_id: str, laptops: list, min_interactions: int = 3):
+def get_cf_scores_for_user_items(user_id: str, laptops: list, min_interactions: int = 1):
     """
-    Trả về dict: laptop_id -> cf_score_raw (chưa scale)
-    Nếu user chưa đủ tương tác / không có trong CF thì trả dict rỗng.
+    Return dict: laptop_id(str normalized) -> raw_cf_score (float)
+    Empty dict if user is cold-start / not in model.
     """
-    global CF_USER_ITEM_MATRIX  # <<< THÊM DÒNG NÀY
+    global CF_USER_ITEM_MATRIX
+
+    def norm_id(x):
+        return str(x).strip().lower() if x is not None else None
 
     if not user_id or CF_MODEL is None or CF_USER_ITEM_MATRIX is None:
         return {}
 
-    u_idx = CF_USER2IDX.get(str(user_id))
+    uid = norm_id(user_id)
+    u_idx = CF_USER2IDX.get(uid) or CF_USER2IDX.get(str(user_id)) 
+    print("[CF] user_id=", user_id, "u_idx=", u_idx, "CF_MODEL=", CF_MODEL is not None, "MATRIX=", CF_USER_ITEM_MATRIX is not None)
+ # fallback
     if u_idx is None:
         return {}
 
-    # Đảm bảo CF_USER_ITEM_MATRIX là CSR để truy cập theo dòng (row) nhanh hơn
-    if hasattr(CF_USER_ITEM_MATRIX, "tocsr"):
-        try:
-            # tránh convert nhiều lần nếu đã là CSR rồi
-            if hasattr(CF_USER_ITEM_MATRIX, "getformat"):
-                if CF_USER_ITEM_MATRIX.getformat() != "csr":
-                    CF_USER_ITEM_MATRIX = CF_USER_ITEM_MATRIX.tocsr()
-            else:
-                CF_USER_ITEM_MATRIX = CF_USER_ITEM_MATRIX.tocsr()
-        except Exception as e:
-            print("Không convert được CF_USER_ITEM_MATRIX sang CSR:", e)
+    # bounds check
+    n_users_model = CF_MODEL.user_factors.shape[0]
+    
+    if u_idx < 0 or u_idx >= n_users_model:
+        print(f"[CF] u_idx out of bounds: user_id={user_id}, u_idx={u_idx}, n_users_model={n_users_model}")
+        
+        return {}
+    
+    # matrix bounds + CSR
+    try:
+        if hasattr(CF_USER_ITEM_MATRIX, "getformat") and CF_USER_ITEM_MATRIX.getformat() != "csr":
+            CF_USER_ITEM_MATRIX = CF_USER_ITEM_MATRIX.tocsr()
+        elif hasattr(CF_USER_ITEM_MATRIX, "tocsr"):
+            CF_USER_ITEM_MATRIX = CF_USER_ITEM_MATRIX.tocsr()
+    except Exception as e:
+        print("[CF] cannot convert matrix to CSR:", e)
 
-    # số lượng items user này đã tương tác trong ma trận
-    user_row = CF_USER_ITEM_MATRIX[u_idx]
-    if getattr(user_row, "nnz", 0) < min_interactions:
-        # user quá “mới” -> chưa dùng CF
+    # cold-start gate
+    try:
+        user_row = CF_USER_ITEM_MATRIX[u_idx]
+        nnz = int(getattr(user_row, "nnz", 0) or 0)
+        print("[CF] nnz interactions =", getattr(user_row, "nnz", None))
+
+        if nnz < int(min_interactions or 1):
+            print(f"[CF] cold-start: nnz={nnz} < min_interactions={min_interactions} for user={user_id}")
+            return {}
+    except Exception as e:
+        print("[CF] cannot read user row:", e)
         return {}
 
-    cf_scores = {}
     u_vec = CF_MODEL.user_factors[u_idx]
+    n_items_model = CF_MODEL.item_factors.shape[0]
+
+    cf_scores = {}
+    miss = 0
+    hit = 0
 
     for lap in laptops:
-        lid = lap.get("id")
+        lid = norm_id(lap.get("id"))
         if not lid:
             continue
 
-        i_idx = CF_ITEM2IDX.get(str(lid))
+        i_idx = CF_ITEM2IDX.get(lid) or CF_ITEM2IDX.get(str(lap.get("id")))  # fallback
         if i_idx is None:
+            miss += 1
+            continue
+
+        if i_idx < 0 or i_idx >= n_items_model:
+            miss += 1
             continue
 
         i_vec = CF_MODEL.item_factors[i_idx]
-        score = float(np.dot(u_vec, i_vec))   # raw CF score
-        cf_scores[str(lid)] = score
+        score = float(np.dot(u_vec, i_vec))
+        cf_scores[lid] = score
+        hit += 1
 
+    if hit == 0:
+        print(f"[CF] no item matched mapping for user={user_id} (miss={miss})")
+    print("[CF] matched items:", len(cf_scores), "/", len(laptops))
+    
     return cf_scores
 
 
 
-def apply_hybrid_scores(laptops: list, user_id: str, alpha: float = 0.7):
-    """
-    Kết hợp:
-        FinalScore = alpha * ContentScore + (1 - alpha) * CFScore_norm
 
-    - ContentScore lấy từ lap["_score"] (do ML ranker tính)
-    - CFScore được min-max scale trên tập laptop đang xét
-    - Chỉ áp dụng nếu user có đủ tương tác cho CF
+
+def apply_hybrid_scores(laptops: list, user_id: str, alpha: float = 0.7, min_interactions: int = 1):
     """
-    if not user_id or CF_MODEL is None:
+    FinalScore = alpha * ContentScore + (1 - alpha) * CFScore_norm
+
+    alpha:
+      - content_only: 1.0
+      - cf_only:      0.0
+      - hybrid:       0.7
+    """
+    if not user_id or CF_MODEL is None or not laptops:
         return laptops
 
-    # Lấy raw CF score cho tất cả laptop hiện có
-    cf_raw = get_cf_scores_for_user_items(user_id, laptops, min_interactions=3)
+    def norm_id(x):
+        return str(x).strip().lower() if x is not None else None
+
+    cf_raw = get_cf_scores_for_user_items(user_id, laptops, min_interactions=min_interactions)
+    print("[CF] cf_raw size:", len(cf_raw))
+    
     if not cf_raw:
-        # user mới / không có trong CF -> giữ nguyên content-based
+        return laptops  # cold-start -> giữ nguyên content
+    if "__ERROR__" in cf_raw:
+        print("[CF] ERROR:", cf_raw["__ERROR__"])
         return laptops
 
-    # Gom tất cả score để scale
-    vals = list(cf_raw.values())
-    min_s = min(vals)
-    max_s = max(vals)
+    # lấy raw theo thứ tự laptop (để scale)
+    pairs = []
+    for lap in laptops:
+        lid = norm_id(lap.get("id"))
+        raw = cf_raw.get(lid)
+        if raw is not None:
+            pairs.append(raw)
+
+    if not pairs:
+        return laptops
+
+    min_s, max_s = min(pairs), max(pairs)
+    flat = (max_s == min_s)
 
     for lap in laptops:
-        lid = str(lap.get("id"))
-        content_score = float(lap.get("_score", 0.0))
+        lid = norm_id(lap.get("id"))
+        content = float(lap.get("_score", 0.0) or 0.0)
 
         raw = cf_raw.get(lid)
-        if raw is None or max_s == min_s:
-            cf_norm = 0.0   # nếu không có cf hoặc tất cả giống nhau thì bỏ CF
+        if raw is None:
+            cf_norm = 0.0
         else:
-            cf_norm = (raw - min_s) / (max_s - min_s)
+            if flat:
+                # nếu phẳng thì set 1.0 cho cái có raw, 0.0 cho cái không raw
+                cf_norm = 1.0
+            else:
+                cf_norm = float((raw - min_s) / (max_s - min_s))
 
+        lap["_content_score"] = content
+        lap["_cf_raw"] = raw
         lap["_cf_score"] = cf_norm
-        lap["_final_score"] = alpha * content_score + (1.0 - alpha) * cf_norm
-        lap["_score"] = lap["_final_score"]  # để các đoạn sau dùng chung '_score'
+        lap["_final_score"] = alpha * content + (1.0 - alpha) * cf_norm
+        lap["_score"] = lap["_final_score"]
 
-    # sắp xếp lại theo final score
     laptops.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
     return laptops
+
+
 
 def build_features_for_items(struct, items):
     budget = struct.get("budget") or 0
@@ -552,7 +631,7 @@ def parse_user_query_to_struct(text: str):
         "program" in t or "code" in t):
         usages.append("lap_trinh")
 
-    if "game" in t or "chơi game" in t:
+    if "game" in t or "chơi game" in t or "gaming" in t:
         usages.append("gaming")
 
     if "thiết kế" in t or "design" in t or "đồ hoạ" in t or "do hoa" in t:
@@ -569,6 +648,227 @@ def parse_user_query_to_struct(text: str):
         "needs_dgpu": needs_dgpu,
         "avoid_dgpu": avoid_dgpu,
     }
+
+
+def _norm_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _extract_usage_list(t: str):
+    # Trả list usage (đúng format mà code bạn đang dùng)
+    usages = []
+
+    # học tập
+    if any(k in t for k in ["học", "hoc", "sinh viên", "sinh vien", "sv", "student"]):
+        usages.append("hoc_tap")
+
+    # văn phòng
+    if any(k in t for k in ["văn phòng", "van phong", "office", "word", "excel", "powerpoint", "ppt", "zoom"]):
+        usages.append("van_phong")
+
+    # lập trình
+    if any(k in t for k in ["lập trình", "lap trinh", "dev", "code", "program", "programming"]):
+        usages.append("lap_trinh")
+
+    # gaming
+    if any(k in t for k in ["gaming", "game", "chơi game", "choi game", "game thủ", "game thu"]):
+        usages.append("gaming")
+
+    # đồ hoạ / thiết kế
+    if any(k in t for k in ["thiết kế", "thiet ke", "design", "đồ hoạ", "do hoa", "photoshop", "illustrator", "premiere", "render"]):
+        usages.append("do_hoa")
+
+    # doanh nhân
+    if any(k in t for k in ["doanh nhân", "doanh nhan", "kinh doanh", "business"]):
+        usages.append("doanh_nhan")
+
+    # loại trùng
+    usages = list(dict.fromkeys(usages))
+    return usages
+
+def _parse_price_range_vnd(t: str):
+    """
+    Trả (min_price, max_price) theo VND.
+    - "20-25tr", "20 đến 25 triệu"
+    - "dưới 25tr" -> max_price
+    - "trên 15tr" -> min_price
+    - "25tr" -> max_price (mặc định)
+    """
+    # 20-25tr / 20 đến 25 triệu
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:tr|triệu|m)\s*(?:-|đến|den|toi|to)\s*(\d+(?:[.,]\d+)?)\s*(?:tr|triệu|m)", t)
+    if m:
+        a = float(m.group(1).replace(",", "."))
+        b = float(m.group(2).replace(",", "."))
+        lo = int(min(a, b) * 1_000_000)
+        hi = int(max(a, b) * 1_000_000)
+        return lo, hi
+
+    # dưới / tối đa / <
+    m = re.search(r"(?:dưới|duoi|tối đa|toi da|<=|≤|<)\s*(\d+(?:[.,]\d+)?)\s*(?:tr|triệu|m)", t)
+    if m:
+        x = float(m.group(1).replace(",", "."))
+        return None, int(x * 1_000_000)
+
+    # trên / tối thiểu / >
+    m = re.search(r"(?:trên|tren|tối thiểu|toi thieu|>=|≥|>)\s*(\d+(?:[.,]\d+)?)\s*(?:tr|triệu|m)", t)
+    if m:
+        x = float(m.group(1).replace(",", "."))
+        return int(x * 1_000_000), None
+
+    # chỉ 1 mức: 25tr / 25 triệu
+    m = re.search(r"\b(\d+(?:[.,]\d+)?)\s*(?:tr|triệu|m)\b", t)
+    if m:
+        x = float(m.group(1).replace(",", "."))
+        return None, int(x * 1_000_000)
+
+    # dạng 20.000.000 hoặc 20000000
+    m = re.search(r"\b(\d{1,3}(?:[.,]\d{3})+|\d{7,9})\b", t)
+    if m:
+        raw = re.sub(r"[.,]", "", m.group(1))
+        try:
+            v = int(raw)
+            if v >= 1_000_000:
+                return None, v
+        except Exception:
+            pass
+
+    return None, None
+
+def _extract_cpu(t: str):
+    # i5 / i7 / i9 / i5-12400h / ryzen 5 / ryzen 7 7840hs
+    m = re.search(r"\b(i[3579])\b", t)
+    if m:
+        # bắt thêm model nếu có
+        m2 = re.search(r"\b" + re.escape(m.group(1)) + r"\s*[-]?\s*(\d{4,5}[a-z]{0,3})\b", t)
+        return f"{m.group(1)}-{m2.group(1)}" if m2 else m.group(1)
+
+    m = re.search(r"\bryzen\s*([3579])\b", t)
+    if m:
+        m2 = re.search(r"\bryzen\s*" + m.group(1) + r"\s*(\d{4,5}[a-z]{0,3})\b", t)
+        return f"ryzen {m.group(1)} {m2.group(1)}" if m2 else f"ryzen {m.group(1)}"
+
+    return None
+
+def _extract_gpu(t: str):
+    # rtx 4050/4060..., gtx 1650..., iris xe...
+    m = re.search(r"\b(rtx)\s*([0-9]{3,4})\b", t)
+    if m:
+        return f"rtx {m.group(2)}"
+
+    m = re.search(r"\b(gtx)\s*([0-9]{3,4})\b", t)
+    if m:
+        return f"gtx {m.group(2)}"
+
+    if "iris xe" in t:
+        return "iris xe"
+
+    if "radeon" in t:
+        return "radeon"
+
+    return None
+
+def _extract_ram_gb(t: str):
+    # ram 16gb / 16gb ram / 16 g
+    m = re.search(r"\bram\s*(\d{1,2})\s*(?:gb|g)\b", t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(\d{1,2})\s*(?:gb|g)\s*ram\b", t)
+    if m:
+        return int(m.group(1))
+    return None
+
+def _extract_storage(t: str):
+    # ssd 512gb / 1tb ssd / hdd 1tb
+    storage_type = None
+    if "ssd" in t:
+        storage_type = "ssd"
+    elif "hdd" in t:
+        storage_type = "hdd"
+
+    storage_gb = None
+    m = re.search(r"\b(\d{3,4})\s*gb\b", t)
+    if m:
+        storage_gb = int(m.group(1))
+
+    m = re.search(r"\b(\d)\s*tb\b", t)
+    if m:
+        storage_gb = int(m.group(1)) * 1024
+
+    return storage_type, storage_gb
+
+def _extract_screen_inch(t: str):
+    # 15.6 inch / 14" / 16 inch
+    m = re.search(r"\b(\d{2}(?:\.\d)?)\s*(?:inch|in|\"|\b)\b", t)
+    if m:
+        try:
+            val = float(m.group(1))
+            if 10 <= val <= 18:
+                return val
+        except Exception:
+            pass
+    return None
+
+def post_process_struct_from_text(raw_text: str, struct: dict) -> dict:
+    """
+    Gọi hàm này NGAY sau parse_user_query_to_struct().
+    - Không phá logic cũ
+    - Fill thêm field nếu đang None/[].
+    """
+    t = _norm_text(raw_text)
+
+    # đảm bảo struct luôn có các key mở rộng
+    struct.setdefault("cpu", None)
+    struct.setdefault("gpu", None)
+    struct.setdefault("ram_gb", None)
+    struct.setdefault("storage_type", None)
+    struct.setdefault("storage_gb", None)
+    struct.setdefault("screen_inch", None)
+    struct.setdefault("min_price", None)
+    struct.setdefault("max_price", None)
+
+    # 1) usage: nếu rỗng/None thì fill bằng rule (gaming ăn chắc)
+    usage_val = struct.get("usage")
+    if not usage_val or (isinstance(usage_val, list) and len(usage_val) == 0):
+        struct["usage"] = _extract_usage_list(t)
+
+    # 2) giá: fill min/max nếu chưa có
+    minp, maxp = _parse_price_range_vnd(t)
+    if struct.get("min_price") is None and minp is not None:
+        struct["min_price"] = minp
+    if struct.get("max_price") is None and maxp is not None:
+        struct["max_price"] = maxp
+
+    # 3) cpu/gpu/ram/storage/screen
+    if struct.get("cpu") is None:
+        struct["cpu"] = _extract_cpu(t)
+
+    if struct.get("gpu") is None:
+        struct["gpu"] = _extract_gpu(t)
+
+    if struct.get("ram_gb") is None:
+        struct["ram_gb"] = _extract_ram_gb(t)
+
+    stype, sgb = _extract_storage(t)
+    if struct.get("storage_type") is None and stype is not None:
+        struct["storage_type"] = stype
+    if struct.get("storage_gb") is None and sgb is not None:
+        struct["storage_gb"] = sgb
+
+    if struct.get("screen_inch") is None:
+        struct["screen_inch"] = _extract_screen_inch(t)
+
+    # 4) tự set needs_dgpu/avoid_dgpu theo keyword GPU (nếu bạn muốn)
+    # (giữ nguyên nếu parse_user_query_to_struct đã set)
+    if struct.get("needs_dgpu") is False and struct.get("avoid_dgpu") is False:
+        # nếu có RTX/GTX -> coi là needs_dgpu
+        if re.search(r"\b(rtx|gtx)\b", t):
+            struct["needs_dgpu"] = True
+        # nếu user nói "không card rời / integrated" -> avoid_dgpu
+        if any(k in t for k in ["không card rời", "khong card roi", "integrated", "onboard", "card onboard", "card tích hợp", "card tich hop"]):
+            struct["avoid_dgpu"] = True
+
+    return struct
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -592,7 +892,7 @@ def save_traffic(data):
 def traffic_ping():
     payload = request.get_json(force=True) or {}
     print("MOBILE PING >>>", payload) 
-    payload["ts"] = datetime.now(timezone.utc).isoformat()
+    payload["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     traffic = load_traffic()
     traffic.append(payload)
     save_traffic(traffic)
@@ -1026,6 +1326,8 @@ def api_recommend():
 
     # --- Phân tích nội dung câu hỏi ---
     struct = parse_user_query_to_struct(raw_query or "")
+    struct = post_process_struct_from_text(raw_query or "", struct)
+
     # struct có thể có: brand, usage, budget, needs_dgpu, avoid_dgpu,...
 
     # ==== HẬU XỬ LÝ GIÁ TỪ CÂU HỎI ====
@@ -1103,6 +1405,11 @@ def api_recommend():
         # fallback: nếu lọc theo cụm ra rỗng thì giữ nguyên danh sách cũ
         if filtered_by_cluster:
             laptops = filtered_by_cluster
+    
+    compare_models_flag = bool(body.get("compare_models"))
+    compare_out = None
+    if compare_models_flag:
+        compare_out = run_compare_models(laptops, struct, user_id, topk, alpha=0.7)
 
     # ===== PREPARE query_type (chỉ còn 4 loại chính) =====
     valid_types = {"keyword", "filter_only", "hybrid", "content_rec", "browse_all"}
@@ -1306,15 +1613,18 @@ def api_recommend():
                     for lap in laptops:
                         lap["_score"] = 0.0
 
-    # ⭐⭐ HYBRID: CONTENT + CF (ALS) ⭐⭐
-    # Nếu user có đủ tương tác trong CF thì trộn;
-    # nếu không, hàm sẽ trả về nguyên danh sách (chỉ content-based).
-            if user_id:
+
+            mode = (body.get("mode") or "auto").lower()
+
+
+# chỉ chạy CF/hybrid khi thật sự yêu cầu (hoặc auto)
+            if user_id and mode in ("cf", "hybrid", "auto"):
                 laptops = apply_hybrid_scores(laptops, user_id, alpha=0.7)
 
-    # ⭐⭐ CÁ NHÂN HÓA THEO USER (rule-based) ⭐⭐
-            if user_id:
+# cá nhân hoá rule-based thì chỉ chạy khi mode != "cf" (tuỳ bạn)
+            if user_id and mode in ("rule", "ranker", "hybrid", "auto"):
                 laptops = apply_personalization(laptops, user_id)
+
 
     # cắt topk sau khi đã hybrid + cá nhân hoá
             result_laptops = laptops[:topk]
@@ -1334,6 +1644,11 @@ def api_recommend():
         "min_price": min_price,
         "max_price": max_price,
         "topk": topk,
+        "cpu": struct.get("cpu"),
+        "gpu": struct.get("gpu"),
+        "ram_gb": struct.get("ram_gb"),
+        "storage_type": struct.get("storage_type"),
+        "storage_gb": struct.get("storage_gb"),
     }
 
     # Chỉ log khi có gì đó "đáng log"
@@ -1363,16 +1678,159 @@ def api_recommend():
             latency_ms=latency_ms,      # 🔹 giờ đã chắc chắn được gán
             source_model=source_model,  # 🔹 lấy từ body (baseline/content_based/hybrid...)
         )
+    
+    include_debug = bool(body.get("compare_models"))
 
-    return jsonify({
+# items (kết quả cuối)
+    items_out = [serialize_laptop(x, include_debug=include_debug) for x in result_laptops]
+
+    resp = {
         "ok": True,
-        "items": result_laptops,
+        "items": items_out,
         "latency_ms": latency_ms,
-    })
+    }
+
+    if include_debug:
+        cmp = run_compare_models(laptops, struct, user_id, topk, alpha=0.7)
+        resp["compare_models"] = {
+            k: [serialize_laptop(x, include_debug=True) for x in v]
+            for k, v in cmp.items()
+        }
+
+    return jsonify(resp)
 
 
 
+import copy
+DEBUG_KEYS = {"_content_score", "_cf_score", "_final_score"}
 
+def serialize_laptop(lap: dict, include_debug: bool = False) -> dict:
+    # Các field public bạn muốn trả về
+    out = {
+        "id": lap.get("id"),
+        "name": lap.get("name"),
+        "brand": lap.get("brand"),
+        "price": lap.get("price"),
+        "promo_price": lap.get("promo_price"),
+        "cpu": lap.get("cpu"),
+        "gpu": lap.get("gpu"),
+        "ram_gb": lap.get("ram_gb"),
+        "storage_type": lap.get("storage_type"),
+        "storage_gb": lap.get("storage_gb"),
+        "screen_size": lap.get("screen_size"),
+        "purpose": lap.get("purpose"),
+        "image_url": lap.get("image_url"),
+        "description": lap.get("description"),
+        "in_stock": lap.get("in_stock"),
+        "stock_qty": lap.get("stock_qty"),
+        "sold_count": lap.get("sold_count"),
+        "kmeans_cluster": lap.get("kmeans_cluster"),
+        "created_at": lap.get("created_at"),
+        "weight_kg": lap.get("weight_kg"),
+        "_score": lap.get("_score"),
+    }
+
+    if include_debug:
+        for k in DEBUG_KEYS:
+            if k in lap:
+                out[k] = lap.get(k)
+
+    return out
+
+
+def run_compare_models(laptops_filtered, struct, user_id, topk, alpha=0.7):
+    """
+    Trả về 4 danh sách độc lập:
+    - content_only: chỉ ML/content score
+    - cf_only: chỉ CF score (không cộng content)
+    - hybrid: content + CF (alpha)
+    - final: hybrid + personalization
+    """
+
+    # 1) COPY list để tránh đè _score qua lại
+    base_for_content = copy.deepcopy(laptops_filtered)
+    base_for_cf      = copy.deepcopy(laptops_filtered)
+    base_for_hybrid  = copy.deepcopy(laptops_filtered)
+    base_for_final   = copy.deepcopy(laptops_filtered)
+
+    # ===== A) CONTENT ONLY =====
+    content_ranked = base_for_content
+    if ML_MODEL is not None and FEATURE_COLS:
+        feats = build_features_for_items(struct, content_ranked)
+        if hasattr(ML_MODEL, "predict_proba"):
+            scores = ML_MODEL.predict_proba(feats)[:, 1]
+        else:
+            scores = ML_MODEL.predict(feats)
+
+        for lap, s in zip(content_ranked, scores):
+            lap["_score"] = float(s)
+    else:
+        # fallback giống bạn
+        budget = struct.get("budget")
+        if budget:
+            for lap in content_ranked:
+                p = float(lap.get("price") or 0)
+                lap["_score"] = -abs(p - budget)
+        else:
+            for lap in content_ranked:
+                lap["_score"] = 0.0
+
+    content_ranked.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+    content_only = content_ranked[:topk]
+
+    # ===== B) CF ONLY =====
+    cf_ranked = base_for_cf
+    # set score = 0 trước, để CF “nắm quyền”
+    for lap in cf_ranked:
+        lap["_score"] = 0.0
+
+    if user_id:
+        cf_ranked = apply_hybrid_scores(cf_ranked, user_id, alpha=0.0, min_interactions=1)  # đúng
+  # alpha=1 => chỉ CF
+    cf_ranked.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+    cf_only = cf_ranked[:topk]
+
+    # ===== C) HYBRID =====
+    hybrid_ranked = base_for_hybrid
+    # 먼저 tính content score
+    if ML_MODEL is not None and FEATURE_COLS:
+        feats = build_features_for_items(struct, hybrid_ranked)
+        if hasattr(ML_MODEL, "predict_proba"):
+            scores = ML_MODEL.predict_proba(feats)[:, 1]
+        else:
+            scores = ML_MODEL.predict(feats)
+        for lap, s in zip(hybrid_ranked, scores):
+            lap["_score"] = float(s)
+    else:
+        budget = struct.get("budget")
+        if budget:
+            for lap in hybrid_ranked:
+                p = float(lap.get("price") or 0)
+                lap["_score"] = -abs(p - budget)
+        else:
+            for lap in hybrid_ranked:
+                lap["_score"] = 0.0
+
+    if user_id:
+        hybrid_ranked = apply_hybrid_scores(hybrid_ranked, user_id, alpha=alpha)
+
+    hybrid_ranked.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+    hybrid = hybrid_ranked[:topk]
+
+    # ===== D) FINAL =====
+    final_ranked = copy.deepcopy(hybrid_ranked)  # copy từ hybrid đã tính xong
+    if user_id:
+        final_ranked = apply_personalization(final_ranked, user_id)
+
+    final_ranked.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+    final = final_ranked[:topk]
+
+    return {
+        "content_only": content_only,
+        "cf_only": cf_only,
+        "hybrid": hybrid,
+        "final": final,
+    }
 
 
 
@@ -4112,8 +4570,4 @@ def check_user_not_locked(user_id):
     return not profile.get("is_locked", False)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
-
-
+    app.run(host="0.0.0.0", port=5000, debug=True)
